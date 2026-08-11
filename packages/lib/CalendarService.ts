@@ -55,6 +55,24 @@ export function joinCalDavObjectUrl(calendarUrl: string, filename: string): stri
   return new URL(filename.replace(/^\//, ""), ensureTrailingSlash(calendarUrl)).href;
 }
 
+/**
+ * Match a fetched CalDAV object to a cal.com booking uid.
+ * Accepts exact ICS UID, `uid@domain` iCalUID forms, or the standard `{uid}.ics` object path.
+ */
+export function matchesCalDavBookingObject(
+  event: Pick<CalendarEventType, "uid" | "url">,
+  bookingUid: string
+): boolean {
+  if (event.uid === bookingUid) return true;
+  if (typeof event.uid === "string" && event.uid.startsWith(`${bookingUid}@`)) return true;
+  try {
+    const { pathname } = new URL(event.url);
+    return pathname.endsWith(`/${bookingUid}.ics`);
+  } catch {
+    return false;
+  }
+}
+
 const CALENDSO_ENCRYPTION_KEY = process.env.CALENDSO_ENCRYPTION_KEY || "";
 
 type FetchObjectsWithOptionalExpandOptionsType = {
@@ -560,15 +578,7 @@ export default abstract class BaseCalendarService implements Calendar {
         : "";
 
       let calendarEvent: CalendarEventType;
-      const eventsToUpdate = events.filter((e) => {
-        if (e.uid === uid) return true;
-        if (typeof e.uid === "string" && e.uid.startsWith(`${uid}@`)) return true;
-        try {
-          return new URL(e.url).pathname.endsWith(`/${uid}.ics`);
-        } catch {
-          return typeof e.url === "string" && e.url.includes(`${uid}.ics`);
-        }
-      });
+      const eventsToUpdate = events.filter((e) => matchesCalDavBookingObject(e, uid));
       return Promise.all(
         eventsToUpdate.map((eventItem) => {
           calendarEvent = eventItem;
@@ -617,16 +627,7 @@ export default abstract class BaseCalendarService implements Calendar {
     try {
       const events = await this.getEventsByUID(uid);
 
-      // Match booking uid, iCalUID forms like `${uid}@Cal.diy`, or the object filename.
-      const eventsToDelete = events.filter((event) => {
-        if (event.uid === uid) return true;
-        if (typeof event.uid === "string" && event.uid.startsWith(`${uid}@`)) return true;
-        try {
-          return new URL(event.url).pathname.endsWith(`/${uid}.ics`);
-        } catch {
-          return typeof event.url === "string" && event.url.includes(`${uid}.ics`);
-        }
-      });
+      const eventsToDelete = events.filter((event) => matchesCalDavBookingObject(event, uid));
       await Promise.all(
         eventsToDelete.map((event) => {
           return deleteCalendarObject({
@@ -963,15 +964,11 @@ export default abstract class BaseCalendarService implements Calendar {
     objectUrls?: string[] | null
   ) {
     try {
-      // Stalwart (and some other CalDAV servers) return no objects for
-      // calendar-multiget unless expand is enabled — without it, delete/update
-      // via getEventsByUID silently finds nothing and leaves events behind.
       const objects = await fetchCalendarObjects({
         calendar: {
           url: ensureTrailingSlash(calId),
         },
         objectUrls: objectUrls ? objectUrls : undefined,
-        expand: objectUrls ? true : undefined,
         timeRange:
           dateFrom && dateTo
             ? {
@@ -982,69 +979,96 @@ export default abstract class BaseCalendarService implements Calendar {
         headers: this.headers,
       });
 
-      const events = objects
-        .filter((e) => !!e.data)
-        .map((object) => {
-          const jcalData = ICAL.parse(sanitizeCalendarObject(object));
-
-          const vcalendar = new ICAL.Component(jcalData);
-
-          const vevent = vcalendar.getFirstSubcomponent("vevent");
-          const event = new ICAL.Event(vevent);
-
-          const calendarTimezone =
-            vcalendar.getFirstSubcomponent("vtimezone")?.getFirstPropertyValue<string>("tzid") || "";
-
-          const startDate = calendarTimezone
-            ? dayjs.tz(event.startDate.toString(), calendarTimezone)
-            : new Date(event.startDate.toUnixTime() * 1000);
-
-          const endDate = calendarTimezone
-            ? dayjs.tz(event.endDate.toString(), calendarTimezone)
-            : new Date(event.endDate.toUnixTime() * 1000);
-
-          return {
-            uid: event.uid,
-            etag: object.etag,
-            url: object.url,
-            summary: event.summary,
-            description: event.description,
-            location: event.location,
-            sequence: event.sequence,
-            startDate,
-            endDate,
-            duration: {
-              weeks: event.duration.weeks,
-              days: event.duration.days,
-              hours: event.duration.hours,
-              minutes: event.duration.minutes,
-              seconds: event.duration.seconds,
-              isNegative: event.duration.isNegative,
-            },
-            organizer: event.organizer,
-            attendees: event.attendees.map((a) => a.getValues()),
-            recurrenceId: event.recurrenceId,
-            timezone: calendarTimezone,
-          };
-        });
-      return events;
+      return objects.filter((e) => !!e.data).map((object) => this.mapDavObjectToCalendarEvent(object));
     } catch (reason) {
       logger.error(reason);
       throw reason;
     }
   }
 
+  /**
+   * Fetch one calendar object by absolute URL via GET.
+   * Prefer this over tsdav `fetchCalendarObjects({ objectUrls })` for delete/update
+   * lookups: some servers (e.g. Stalwart) return empty multiget responses, and
+   * `expand: true` incorrectly widens the request to a full-collection query.
+   */
+  private async fetchCalendarObjectByUrl(objectUrl: string): Promise<CalendarEventType | null> {
+    try {
+      const response = await fetch(objectUrl, {
+        method: "GET",
+        headers: this.headers,
+      });
+      if (response.status === 404 || response.status === 410) {
+        return null;
+      }
+      if (!response.ok) {
+        throw new Error(`CalDAV GET ${objectUrl} failed with status ${response.status}`);
+      }
+      const data = await response.text();
+      if (!data) {
+        return null;
+      }
+      const etag = response.headers.get("etag") ?? "";
+      return this.mapDavObjectToCalendarEvent({ url: objectUrl, etag, data });
+    } catch (reason) {
+      logger.error(reason);
+      throw reason;
+    }
+  }
+
+  private mapDavObjectToCalendarEvent(object: DAVObject): CalendarEventType {
+    const jcalData = ICAL.parse(sanitizeCalendarObject(object));
+
+    const vcalendar = new ICAL.Component(jcalData);
+
+    const vevent = vcalendar.getFirstSubcomponent("vevent");
+    const event = new ICAL.Event(vevent);
+
+    const calendarTimezone =
+      vcalendar.getFirstSubcomponent("vtimezone")?.getFirstPropertyValue<string>("tzid") || "";
+
+    const startDate = calendarTimezone
+      ? dayjs.tz(event.startDate.toString(), calendarTimezone)
+      : new Date(event.startDate.toUnixTime() * 1000);
+
+    const endDate = calendarTimezone
+      ? dayjs.tz(event.endDate.toString(), calendarTimezone)
+      : new Date(event.endDate.toUnixTime() * 1000);
+
+    return {
+      uid: event.uid,
+      etag: object.etag,
+      url: object.url,
+      summary: event.summary,
+      description: event.description,
+      location: event.location,
+      sequence: event.sequence,
+      startDate,
+      endDate,
+      duration: {
+        weeks: event.duration.weeks,
+        days: event.duration.days,
+        hours: event.duration.hours,
+        minutes: event.duration.minutes,
+        seconds: event.duration.seconds,
+        isNegative: event.duration.isNegative,
+      },
+      organizer: event.organizer,
+      attendees: event.attendees.map((a) => a.getValues()),
+      recurrenceId: event.recurrenceId,
+      timezone: calendarTimezone,
+    };
+  }
+
   private async getEventsByUID(uid: string): Promise<CalendarEventType[]> {
-    type EventsType = Awaited<ReturnType<typeof this.getEvents>>;
-    const events: EventsType = [];
+    const events: CalendarEventType[] = [];
     const calendars = await this.listCalendars();
 
     for (const cal of calendars) {
       const objectUrl = joinCalDavObjectUrl(cal.externalId, `${uid}.ics`);
-      const calEvents = await this.getEvents(ensureTrailingSlash(cal.externalId), null, null, [objectUrl]);
-
-      for (const ev of calEvents) {
-        events.push(ev);
+      const event = await this.fetchCalendarObjectByUrl(objectUrl);
+      if (event && matchesCalDavBookingObject(event, uid)) {
+        events.push(event);
       }
     }
 

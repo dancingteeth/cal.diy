@@ -1,6 +1,6 @@
 import { createEvent as createIcsEvent } from "ics";
 import { createCalendarObject, updateCalendarObject } from "tsdav";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("ics", () => ({
   createEvent: vi.fn(),
@@ -41,7 +41,11 @@ vi.mock("./CalEventParser", () => ({
 }));
 
 import type { CalendarServiceEvent } from "@calcom/types/Calendar";
-import BaseCalendarService, { ensureTrailingSlash, joinCalDavObjectUrl } from "./CalendarService";
+import BaseCalendarService, {
+  ensureTrailingSlash,
+  joinCalDavObjectUrl,
+  matchesCalDavBookingObject,
+} from "./CalendarService";
 
 const createMockEvent = (overrides: Partial<CalendarServiceEvent> = {}): CalendarServiceEvent => ({
   type: "caldav",
@@ -768,13 +772,81 @@ describe("CalDAV collection URL normalization", () => {
       "https://mail.example.com/dav/cal/user/default/booking-uid.ics"
     );
   });
+});
 
-  it("deleteEvent looks up objects under the collection when externalId has no trailing slash", async () => {
-    const { fetchCalendarObjects, deleteCalendarObject } = await import("tsdav");
+describe("matchesCalDavBookingObject", () => {
+  const objectUrl = "https://mail.example.com/dav/cal/user/default/booking-uid.ics";
+
+  it("matches exact ICS UID", () => {
+    expect(matchesCalDavBookingObject({ uid: "booking-uid", url: objectUrl }, "booking-uid")).toBe(true);
+  });
+
+  it("matches iCalUID forms like bookingUid@Cal.diy", () => {
+    expect(
+      matchesCalDavBookingObject({ uid: "booking-uid@Cal.diy", url: objectUrl }, "booking-uid")
+    ).toBe(true);
+    expect(
+      matchesCalDavBookingObject({ uid: "booking-uid@example.com", url: objectUrl }, "booking-uid")
+    ).toBe(true);
+  });
+
+  it("matches by object pathname even when ICS UID differs", () => {
+    expect(
+      matchesCalDavBookingObject(
+        { uid: "totally-different-uid", url: objectUrl },
+        "booking-uid"
+      )
+    ).toBe(true);
+  });
+
+  it("does not match unrelated UIDs or substrings in the path", () => {
+    expect(
+      matchesCalDavBookingObject(
+        {
+          uid: "other@Cal.diy",
+          url: "https://mail.example.com/dav/cal/user/default/other-booking-uid.ics",
+        },
+        "booking-uid"
+      )
+    ).toBe(false);
+    expect(
+      matchesCalDavBookingObject(
+        {
+          uid: "prefix-booking-uid",
+          url: "https://mail.example.com/dav/cal/user/default/prefix-booking-uid.ics",
+        },
+        "booking-uid"
+      )
+    ).toBe(false);
+  });
+});
+
+describe("CalDAV deleteEvent object lookup", () => {
+  const uid = "booking-uid-from-database-abc123";
+  const calendarWithoutSlash = "https://mail.example.com/dav/cal/user/default";
+  const expectedObjectUrl = `${calendarWithoutSlash}/${uid}.ics`;
+  const icsBody = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:${uid}\r\nDTSTART:20230615T150000Z\r\nDTEND:20230615T160000Z\r\nEND:VEVENT\r\nEND:VCALENDAR`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => icsBody,
+        headers: { get: (name: string) => (name.toLowerCase() === "etag" ? '"etag-1"' : null) },
+      })
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("GETs the object under the collection when externalId has no trailing slash", async () => {
+    const { deleteCalendarObject, fetchCalendarObjects } = await import("tsdav");
     const service = new TestCalendarService();
-    const uid = "booking-uid-from-database-abc123";
-    const calendarWithoutSlash = "https://mail.example.com/dav/cal/user/default";
-    const expectedObjectUrl = `${calendarWithoutSlash}/${uid}.ics`;
 
     vi.spyOn(service, "listCalendars").mockResolvedValue([
       {
@@ -787,25 +859,17 @@ describe("CalDAV collection URL normalization", () => {
         credentialId: 1,
       },
     ]);
-
-    vi.mocked(fetchCalendarObjects).mockResolvedValue([
-      {
-        url: expectedObjectUrl,
-        etag: '"etag-1"',
-        data: `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:${uid}\r\nDTSTART:20230615T150000Z\r\nDTEND:20230615T160000Z\r\nEND:VEVENT\r\nEND:VCALENDAR`,
-      },
-    ]);
     vi.mocked(deleteCalendarObject).mockResolvedValue({ status: 204 } as never);
 
     await service.deleteEvent(uid);
 
-    expect(fetchCalendarObjects).toHaveBeenCalledWith(
+    expect(fetch).toHaveBeenCalledWith(
+      expectedObjectUrl,
       expect.objectContaining({
-        calendar: { url: `${calendarWithoutSlash}/` },
-        objectUrls: [expectedObjectUrl],
-        expand: true,
+        method: "GET",
       })
     );
+    expect(fetchCalendarObjects).not.toHaveBeenCalled();
     expect(deleteCalendarObject).toHaveBeenCalledWith(
       expect.objectContaining({
         calendarObject: expect.objectContaining({
@@ -813,5 +877,75 @@ describe("CalDAV collection URL normalization", () => {
         }),
       })
     );
+  });
+
+  it("deletes when ICS UID is bookingUid@Cal.diy but filename uses booking uid", async () => {
+    const { deleteCalendarObject } = await import("tsdav");
+    const service = new TestCalendarService();
+    const icsWithDomainUid = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:${uid}@Cal.diy\r\nDTSTART:20230615T150000Z\r\nDTEND:20230615T160000Z\r\nEND:VEVENT\r\nEND:VCALENDAR`;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => icsWithDomainUid,
+        headers: { get: () => '"etag-2"' },
+      })
+    );
+
+    vi.spyOn(service, "listCalendars").mockResolvedValue([
+      {
+        externalId: `${calendarWithoutSlash}/`,
+        name: "Stalwart Calendar",
+        primary: true,
+        readOnly: false,
+        email: "paul@example.com",
+        integrationName: "caldav",
+        credentialId: 1,
+      },
+    ]);
+    vi.mocked(deleteCalendarObject).mockResolvedValue({ status: 204 } as never);
+
+    await service.deleteEvent(uid);
+
+    expect(deleteCalendarObject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        calendarObject: expect.objectContaining({
+          url: `${calendarWithoutSlash}/${uid}.ics`,
+        }),
+      })
+    );
+  });
+
+  it("skips delete when the object is not found", async () => {
+    const { deleteCalendarObject } = await import("tsdav");
+    const service = new TestCalendarService();
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        text: async () => "",
+        headers: { get: () => null },
+      })
+    );
+
+    vi.spyOn(service, "listCalendars").mockResolvedValue([
+      {
+        externalId: `${calendarWithoutSlash}/`,
+        name: "Stalwart Calendar",
+        primary: true,
+        readOnly: false,
+        email: "paul@example.com",
+        integrationName: "caldav",
+        credentialId: 1,
+      },
+    ]);
+
+    await service.deleteEvent(uid);
+
+    expect(deleteCalendarObject).not.toHaveBeenCalled();
   });
 });
