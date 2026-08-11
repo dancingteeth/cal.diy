@@ -963,11 +963,15 @@ export default abstract class BaseCalendarService implements Calendar {
     objectUrls?: string[] | null
   ) {
     try {
+      // Stalwart (and some other CalDAV servers) return no objects for
+      // calendar-multiget unless expand is enabled — without it, delete/update
+      // via getEventsByUID silently finds nothing and leaves events behind.
       const objects = await fetchCalendarObjects({
         calendar: {
           url: ensureTrailingSlash(calId),
         },
         objectUrls: objectUrls ? objectUrls : undefined,
+        expand: objectUrls ? true : undefined,
         timeRange:
           dateFrom && dateTo
             ? {

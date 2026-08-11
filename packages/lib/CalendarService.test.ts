@@ -803,6 +803,7 @@ describe("CalDAV collection URL normalization", () => {
       expect.objectContaining({
         calendar: { url: `${calendarWithoutSlash}/` },
         objectUrls: [expectedObjectUrl],
+        expand: true,
       })
     );
     expect(deleteCalendarObject).toHaveBeenCalledWith(
