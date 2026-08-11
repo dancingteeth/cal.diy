@@ -41,7 +41,7 @@ vi.mock("./CalEventParser", () => ({
 }));
 
 import type { CalendarServiceEvent } from "@calcom/types/Calendar";
-import BaseCalendarService from "./CalendarService";
+import BaseCalendarService, { ensureTrailingSlash, joinCalDavObjectUrl } from "./CalendarService";
 
 const createMockEvent = (overrides: Partial<CalendarServiceEvent> = {}): CalendarServiceEvent => ({
   type: "caldav",
@@ -746,5 +746,71 @@ describe("CalendarService - SCHEDULE-AGENT injection", () => {
 
       await expect(service.createEvent(event, 1)).rejects.toThrow();
     });
+  });
+});
+
+describe("CalDAV collection URL normalization", () => {
+  it("ensureTrailingSlash appends a slash when missing", () => {
+    expect(ensureTrailingSlash("https://mail.example.com/dav/cal/user/default")).toBe(
+      "https://mail.example.com/dav/cal/user/default/"
+    );
+    expect(ensureTrailingSlash("https://mail.example.com/dav/cal/user/default/")).toBe(
+      "https://mail.example.com/dav/cal/user/default/"
+    );
+  });
+
+  it("joinCalDavObjectUrl matches tsdav createCalendarObject URL resolution", () => {
+    // Without normalization, `new URL(filename, collectionWithoutSlash)` would drop the last segment.
+    expect(joinCalDavObjectUrl("https://mail.example.com/dav/cal/user/default", "booking-uid.ics")).toBe(
+      "https://mail.example.com/dav/cal/user/default/booking-uid.ics"
+    );
+    expect(joinCalDavObjectUrl("https://mail.example.com/dav/cal/user/default/", "booking-uid.ics")).toBe(
+      "https://mail.example.com/dav/cal/user/default/booking-uid.ics"
+    );
+  });
+
+  it("deleteEvent looks up objects under the collection when externalId has no trailing slash", async () => {
+    const { fetchCalendarObjects, deleteCalendarObject } = await import("tsdav");
+    const service = new TestCalendarService();
+    const uid = "booking-uid-from-database-abc123";
+    const calendarWithoutSlash = "https://mail.example.com/dav/cal/user/default";
+    const expectedObjectUrl = `${calendarWithoutSlash}/${uid}.ics`;
+
+    vi.spyOn(service, "listCalendars").mockResolvedValue([
+      {
+        externalId: calendarWithoutSlash,
+        name: "Stalwart Calendar",
+        primary: true,
+        readOnly: false,
+        email: "paul@example.com",
+        integrationName: "caldav",
+        credentialId: 1,
+      },
+    ]);
+
+    vi.mocked(fetchCalendarObjects).mockResolvedValue([
+      {
+        url: expectedObjectUrl,
+        etag: '"etag-1"',
+        data: `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:${uid}\r\nDTSTART:20230615T150000Z\r\nDTEND:20230615T160000Z\r\nEND:VEVENT\r\nEND:VCALENDAR`,
+      },
+    ]);
+    vi.mocked(deleteCalendarObject).mockResolvedValue({ status: 204 } as never);
+
+    await service.deleteEvent(uid);
+
+    expect(fetchCalendarObjects).toHaveBeenCalledWith(
+      expect.objectContaining({
+        calendar: { url: `${calendarWithoutSlash}/` },
+        objectUrls: [expectedObjectUrl],
+      })
+    );
+    expect(deleteCalendarObject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        calendarObject: expect.objectContaining({
+          url: expectedObjectUrl,
+        }),
+      })
+    );
   });
 });

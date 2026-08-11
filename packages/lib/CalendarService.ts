@@ -38,6 +38,23 @@ import logger from "./logger";
 const TIMEZONE_FORMAT = "YYYY-MM-DDTHH:mm:ss[Z]";
 const DEFAULT_CALENDAR_TYPE = "caldav";
 
+/**
+ * CalDAV collection URLs must end with `/` so `new URL(filename, calendarUrl)`
+ * (used by tsdav's createCalendarObject) resolves under the collection instead of
+ * replacing the last path segment. Servers like Stalwart often omit the slash.
+ */
+export function ensureTrailingSlash(url: string): string {
+  return url.endsWith("/") ? url : `${url}/`;
+}
+
+/**
+ * Build the object URL the same way tsdav does when creating (`new URL(filename, calendar.url)`),
+ * after normalizing the collection URL. Used by update/delete lookups via getEventsByUID.
+ */
+export function joinCalDavObjectUrl(calendarUrl: string, filename: string): string {
+  return new URL(filename.replace(/^\//, ""), ensureTrailingSlash(calendarUrl)).href;
+}
+
 const CALENDSO_ENCRYPTION_KEY = process.env.CALENDSO_ENCRYPTION_KEY || "";
 
 type FetchObjectsWithOptionalExpandOptionsType = {
@@ -467,13 +484,14 @@ export default abstract class BaseCalendarService implements Calendar {
         calendars
           .filter((c) =>
             mainHostDestinationCalendar?.externalId
-              ? c.externalId === mainHostDestinationCalendar.externalId
+              ? ensureTrailingSlash(c.externalId) ===
+                ensureTrailingSlash(mainHostDestinationCalendar.externalId)
               : true
           )
           .map((calendar) =>
             createCalendarObject({
               calendar: {
-                url: calendar.externalId,
+                url: ensureTrailingSlash(calendar.externalId),
               },
               filename: `${uid}.ics`,
               iCalString: injectScheduleAgent(iCalStringWithTimezone),
@@ -829,12 +847,13 @@ export default abstract class BaseCalendarService implements Calendar {
       return calendars.reduce<IntegrationCalendar[]>((newCalendars, calendar) => {
         if (!calendar.components?.includes("VEVENT")) return newCalendars;
         const [mainHostDestinationCalendar] = event?.destinationCalendar ?? [];
+        const calendarUrl = ensureTrailingSlash(calendar.url);
         newCalendars.push({
-          externalId: calendar.url,
+          externalId: calendarUrl,
           /** @url https://github.com/calcom/cal.diy/issues/7186 */
           name: typeof calendar.displayName === "string" ? calendar.displayName : "",
           primary: mainHostDestinationCalendar?.externalId
-            ? mainHostDestinationCalendar.externalId === calendar.url
+            ? ensureTrailingSlash(mainHostDestinationCalendar.externalId) === calendarUrl
             : false,
           integration: this.integrationName,
           email: this.credentials.username ?? "",
@@ -874,7 +893,7 @@ export default abstract class BaseCalendarService implements Calendar {
       const response = await fetchCalendarObjects({
         urlFilter: (url) => this.isValidFormat(url),
         calendar: {
-          url: sc.externalId,
+          url: ensureTrailingSlash(sc.externalId),
         },
         headers,
         expand: true,
@@ -892,7 +911,7 @@ export default abstract class BaseCalendarService implements Calendar {
             const responseWithoutExpand = await fetchCalendarObjects({
               urlFilter: (url) => this.isValidFormat(url),
               calendar: {
-                url: sc.externalId,
+                url: ensureTrailingSlash(sc.externalId),
               },
               headers,
               expand: false,
@@ -929,7 +948,7 @@ export default abstract class BaseCalendarService implements Calendar {
     try {
       const objects = await fetchCalendarObjects({
         calendar: {
-          url: calId,
+          url: ensureTrailingSlash(calId),
         },
         objectUrls: objectUrls ? objectUrls : undefined,
         timeRange:
@@ -1000,7 +1019,8 @@ export default abstract class BaseCalendarService implements Calendar {
     const calendars = await this.listCalendars();
 
     for (const cal of calendars) {
-      const calEvents = await this.getEvents(cal.externalId, null, null, [`${cal.externalId}${uid}.ics`]);
+      const objectUrl = joinCalDavObjectUrl(cal.externalId, `${uid}.ics`);
+      const calEvents = await this.getEvents(ensureTrailingSlash(cal.externalId), null, null, [objectUrl]);
 
       for (const ev of calEvents) {
         events.push(ev);
