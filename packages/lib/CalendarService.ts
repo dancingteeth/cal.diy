@@ -560,7 +560,15 @@ export default abstract class BaseCalendarService implements Calendar {
         : "";
 
       let calendarEvent: CalendarEventType;
-      const eventsToUpdate = events.filter((e) => e.uid === uid);
+      const eventsToUpdate = events.filter((e) => {
+        if (e.uid === uid) return true;
+        if (typeof e.uid === "string" && e.uid.startsWith(`${uid}@`)) return true;
+        try {
+          return new URL(e.url).pathname.endsWith(`/${uid}.ics`);
+        } catch {
+          return typeof e.url === "string" && e.url.includes(`${uid}.ics`);
+        }
+      });
       return Promise.all(
         eventsToUpdate.map((eventItem) => {
           calendarEvent = eventItem;
@@ -609,7 +617,16 @@ export default abstract class BaseCalendarService implements Calendar {
     try {
       const events = await this.getEventsByUID(uid);
 
-      const eventsToDelete = events.filter((event) => event.uid === uid);
+      // Match booking uid, iCalUID forms like `${uid}@Cal.diy`, or the object filename.
+      const eventsToDelete = events.filter((event) => {
+        if (event.uid === uid) return true;
+        if (typeof event.uid === "string" && event.uid.startsWith(`${uid}@`)) return true;
+        try {
+          return new URL(event.url).pathname.endsWith(`/${uid}.ics`);
+        } catch {
+          return typeof event.url === "string" && event.url.includes(`${uid}.ics`);
+        }
+      });
       await Promise.all(
         eventsToDelete.map((event) => {
           return deleteCalendarObject({
